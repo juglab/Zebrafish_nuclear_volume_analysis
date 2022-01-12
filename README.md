@@ -17,8 +17,3 @@ You are all set to run the notebooks now. Note that when running any notebook, y
 ## Usage
 
 Go to the folder `examples/3D/`. This contains three notebooks: `1_training.ipynb` (for training a new StarDist 3D model if you have raw images and corresponding GT segmentation images for training), `2_prediction.ipynb` (for predicting on unseen test images after training is performed or if you already have a trained model), `Fish_statistics.ipynb`(this computes the metrics such as volumes given segmented images and writes the resultrs out as .xls spreadsheets).
-
-## Trained model
-
-If you simply want to use the trained model used in the [*paper*](https://www.biorxiv.org/content/biorxiv/early/2021/07/27/2021.07.27.453460.full.pdf) and want to use it to predict results on new data, skip `1_training.ipynb` notebook and simply start with `2_prediction.ipynb`. The trained model is provided in this repository at `examples/3D/models/stardist_fish_5gt/`.
-
