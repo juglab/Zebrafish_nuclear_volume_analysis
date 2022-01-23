@@ -7,8 +7,8 @@ Additionally, this repository contains a custom script for computing multiple me
 Follow the steps below to setup all packages on which the notebooks depend. <br>
 (i) Move to the command prompt and enter `git clone https://github.com/mangalp/Zebrafish_Segmentation_Setup/`. <br>
 (ii) Move to the folder where the repository was cloned by `cd Zebrafish_Segmentation_Setup`. <br>
-(iii) Create a new conda environment by the command `conda env create -f segmentation_stardist.yml`. <br>
-(iv) Activate the conda environemnt `conda activate segmentation_stardist`. <br>
+(iii)Install tensorflow by `conda install tensorflow-gpu=1.14` <br>
+(iv) Install StarDist by `pip install "stardist[tf1]"` <br>
 (v) Install jupyter with the command `pip install jupyter`. <br>
 (vii) Finally, execute the command `pip install ipykernel` followed by the command `python -m ipykernel install --user --name segmentation_stardist --display-name 'segmentation_stardist'`. <br>
 
