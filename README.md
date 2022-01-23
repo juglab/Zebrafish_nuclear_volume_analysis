@@ -16,4 +16,4 @@ You are all set to run the notebooks now. Note that when running any notebook, y
 
 ## Usage
 
-Go to the folder `examples/3D/`. This contains three notebooks: `1_training.ipynb` (for training a new StarDist 3D model if you have raw images and corresponding GT segmentation images for training), `2_prediction.ipynb` (for predicting on unseen test images after training is performed or if you already have a trained model), `Fish_statistics.ipynb`(this computes the metrics such as volumes given segmented images and writes the resultrs out as .xls spreadsheets).
+Go to the folder `examples/3D/`. This contains three notebooks: `0_ddata.ipynb` (for visualizing the training data and automatic determination of Z-stack anisotropy factor to be usedd later), `1_training.ipynb` (for training a new StarDist 3D model if you have raw images and corresponding GT segmentation images for training), `2_prediction.ipynb` (for predicting on unseen test images after training is performed or if you already have a trained model), `Fish_statistics.ipynb`(this computes the metrics such as volumes given segmented images and writes the resultrs out as .xls spreadsheets).
