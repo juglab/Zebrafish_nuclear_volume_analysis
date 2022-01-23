@@ -5,6 +5,7 @@ import warnings
 import os
 import datetime
 from tqdm import tqdm
+from collections import defaultdict
 from zipfile import ZipFile, ZIP_DEFLATED
 from scipy.ndimage.morphology import distance_transform_edt, binary_fill_holes
 from scipy.ndimage.measurements import find_objects
@@ -12,8 +13,28 @@ from scipy.optimize import minimize_scalar
 from skimage.measure import regionprops
 from csbdeep.utils import _raise
 from csbdeep.utils.six import Path
+from collections.abc import Iterable
 
-from .matching import matching_dataset
+from .matching import matching_dataset, _check_label_array
+
+
+try:
+    from edt import edt
+    _edt_available = True
+    try:    _edt_parallel_max = len(os.sched_getaffinity(0))
+    except: _edt_parallel_max = 128
+    _edt_parallel_default = 4
+    _edt_parallel = os.environ.get('STARDIST_EDT_NUM_THREADS', _edt_parallel_default)
+    try:
+        _edt_parallel = min(_edt_parallel_max, int(_edt_parallel))
+    except ValueError as e:
+        warnings.warn(f"Invalid value ({_edt_parallel}) for STARDIST_EDT_NUM_THREADS. Using default value ({_edt_parallel_default}) instead.")
+        _edt_parallel = _edt_parallel_default
+    del _edt_parallel_default, _edt_parallel_max
+except ImportError:
+    _edt_available = False
+    # warnings.warn("Could not find package edt... \nConsider installing it with \n  pip install edt\nto improve training data generation performance.")
+    pass
 
 
 def gputools_available():
@@ -44,35 +65,46 @@ def _normalize_grid(grid,n):
          all(map(_is_power_of_2,grid))) or _raise(TypeError())
         return tuple(int(g) for g in grid)
     except (TypeError, AssertionError):
-        raise ValueError("grid must be a list/tuple of length {n} with values that are power of 2".format(n=n))
-
-
-def _edt_prob(lbl_img, anisotropy=None):
-    try:
-        from edt import edt as edt_func
-        dist_func = lambda img: edt_func(img>0, anisotropy=anisotropy)
-    except ImportError:
-        dist_func = lambda img: distance_transform_edt(img, sampling=anisotropy)
-    prob = np.zeros(lbl_img.shape,np.float32)
-    for l in (set(np.unique(lbl_img)) - set([0])):
-        mask = lbl_img==l
-        edt = dist_func(mask)[mask]
-        prob[mask] = edt/(np.max(edt)+1e-10)
-    return prob
+        raise ValueError("grid = {grid} must be a list/tuple of length {n} with values that are power of 2".format(grid=grid, n=n))
 
 
 def edt_prob(lbl_img, anisotropy=None):
+    if _edt_available:
+        return _edt_prob_edt(lbl_img, anisotropy=anisotropy)
+    else:
+        # warnings.warn("Could not find package edt... \nConsider installing it with \n  pip install edt\nto improve training data generation performance.")
+        return _edt_prob_scipy(lbl_img, anisotropy=anisotropy)
+
+def _edt_prob_edt(lbl_img, anisotropy=None):
+    """Perform EDT on each labeled object and normalize.
+    Internally uses https://github.com/seung-lab/euclidean-distance-transform-3d
+    that can handle multiple labels at once
+    """
+    lbl_img = np.ascontiguousarray(lbl_img)
+    constant_img = lbl_img.min() == lbl_img.max() and lbl_img.flat[0] > 0
+    if constant_img:
+        warnings.warn("EDT of constant label image is ill-defined. (Assuming background around it.)")
+    # we just need to compute the edt once but then normalize it for each object
+    prob = edt(lbl_img, anisotropy=anisotropy, black_border=constant_img, parallel=_edt_parallel)
+    objects = find_objects(lbl_img)
+    for i,sl in enumerate(objects,1):
+        # i: object label id, sl: slices of object in lbl_img
+        if sl is None: continue
+        _mask = lbl_img[sl]==i
+        # normalize it
+        prob[sl][_mask] /= np.max(prob[sl][_mask]+1e-10)
+    return prob
+
+def _edt_prob_scipy(lbl_img, anisotropy=None):
     """Perform EDT on each labeled object and normalize."""
     def grow(sl,interior):
         return tuple(slice(s.start-int(w[0]),s.stop+int(w[1])) for s,w in zip(sl,interior))
     def shrink(interior):
         return tuple(slice(int(w[0]),(-1 if w[1] else None)) for w in interior)
-
-    try:
-        from edt import edt as edt_func
-        dist_func = lambda img: edt_func(img>0, anisotropy=anisotropy)
-    except ImportError:
-        dist_func = lambda img: distance_transform_edt(img, sampling=anisotropy)
+    constant_img = lbl_img.min() == lbl_img.max() and lbl_img.flat[0] > 0
+    if constant_img:
+        lbl_img = np.pad(lbl_img, ((1,1),)*lbl_img.ndim, mode='constant')
+        warnings.warn("EDT of constant label image is ill-defined. (Assuming background around it.)")
     objects = find_objects(lbl_img)
     prob = np.zeros(lbl_img.shape,np.float32)
     for i,sl in enumerate(objects,1):
@@ -86,8 +118,10 @@ def edt_prob(lbl_img, anisotropy=None):
         shrink_slice = shrink(interior)
         grown_mask = lbl_img[grow(sl,interior)]==i
         mask = grown_mask[shrink_slice]
-        edt = dist_func(grown_mask)[shrink_slice][mask]
+        edt = distance_transform_edt(grown_mask, sampling=anisotropy)[shrink_slice][mask]
         prob[sl][mask] = edt/(np.max(edt)+1e-10)
+    if constant_img:
+        prob = prob[(slice(1,-1),)*lbl_img.ndim].copy()
     return prob
 
 
@@ -145,7 +179,7 @@ def sample_points(n_samples, mask, prob=None, b=2):
 
 def calculate_extents(lbl, func=np.median):
     """ Aggregate bounding box sizes of objects in label images. """
-    if isinstance(lbl,(tuple,list)) or (isinstance(lbl,np.ndarray) and lbl.ndim==4):
+    if (isinstance(lbl,np.ndarray) and lbl.ndim==4) or (not isinstance(lbl,np.ndarray) and  isinstance(lbl,Iterable)):
         return func(np.stack([calculate_extents(_lbl,func) for _lbl in lbl], axis=0), axis=0)
 
     n = lbl.ndim
@@ -159,25 +193,32 @@ def calculate_extents(lbl, func=np.median):
         return func(extents, axis=0)
 
 
-def polyroi_bytearray(x,y,pos=None):
+def polyroi_bytearray(x,y,pos=None,subpixel=True):
     """ Byte array of polygon roi with provided x and y coordinates
         See https://github.com/imagej/imagej1/blob/master/ij/io/RoiDecoder.java
     """
+    import struct
     def _int16(x):
         return int(x).to_bytes(2, byteorder='big', signed=True)
     def _uint16(x):
         return int(x).to_bytes(2, byteorder='big', signed=False)
     def _int32(x):
         return int(x).to_bytes(4, byteorder='big', signed=True)
+    def _float(x):
+        return struct.pack(">f", x)
 
-    x = np.asarray(x).ravel()
-    y = np.asarray(y).ravel()
+    subpixel = bool(subpixel)
+    # add offset since pixel center is at (0.5,0.5) in ImageJ
+    x_raw = np.asarray(x).ravel() + 0.5
+    y_raw = np.asarray(y).ravel() + 0.5
+    x = np.round(x_raw)
+    y = np.round(y_raw)
     assert len(x) == len(y)
     top, left, bottom, right = y.min(), x.min(), y.max(), x.max() # bbox
 
     n_coords = len(x)
     bytes_header = 64
-    bytes_total = bytes_header + n_coords*2*2
+    bytes_total = bytes_header + n_coords*2*2 + subpixel*n_coords*2*4
     B = [0] * bytes_total
     B[ 0: 4] = map(ord,'Iout')   # magic start
     B[ 4: 6] = _int16(227)       # version
@@ -187,6 +228,8 @@ def polyroi_bytearray(x,y,pos=None):
     B[12:14] = _int16(bottom)    # bbox bottom
     B[14:16] = _int16(right)     # bbox right
     B[16:18] = _uint16(n_coords) # number of coordinates
+    if subpixel:
+        B[50:52] = _int16(128)   # subpixel resolution (option flag)
     if pos is not None:
         B[56:60] = _int32(pos)   # position (C, Z, or T)
 
@@ -196,10 +239,19 @@ def polyroi_bytearray(x,y,pos=None):
         B[xs:xs+2] = _int16(_x - left)
         B[ys:ys+2] = _int16(_y - top)
 
+    if subpixel:
+        base1 = bytes_header + n_coords*2*2
+        base2 = base1 + n_coords*4
+        for i,(_x,_y) in enumerate(zip(x_raw,y_raw)):
+            xs = base1 + 4*i
+            ys = base2 + 4*i
+            B[xs:xs+4] = _float(_x)
+            B[ys:ys+4] = _float(_y)
+
     return bytearray(B)
 
 
-def export_imagej_rois(fname, polygons, set_position=True, compression=ZIP_DEFLATED):
+def export_imagej_rois(fname, polygons, set_position=True, subpixel=True, compression=ZIP_DEFLATED):
     """ polygons assumed to be a list of arrays with shape (id,2,c) """
 
     if isinstance(polygons,np.ndarray):
@@ -207,12 +259,12 @@ def export_imagej_rois(fname, polygons, set_position=True, compression=ZIP_DEFLA
 
     fname = Path(fname)
     if fname.suffix == '.zip':
-        fname = Path(fname.stem)
+        fname = fname.with_suffix('')
 
     with ZipFile(str(fname)+'.zip', mode='w', compression=compression) as roizip:
         for pos,polygroup in enumerate(polygons,start=1):
             for i,poly in enumerate(polygroup,start=1):
-                roi = polyroi_bytearray(poly[1],poly[0], pos=(pos if set_position else None))
+                roi = polyroi_bytearray(poly[1],poly[0], pos=(pos if set_position else None), subpixel=subpixel)
                 roizip.writestr('{pos:03d}_{i:03d}.roi'.format(pos=pos,i=i), roi)
 
 
@@ -253,3 +305,90 @@ def optimize_threshold(Y, Yhat, model, nms_thresh, measure='accuracy', iou_thres
 
     verbose > 1 and print('\n',opt, flush=True)
     return opt.x, -opt.fun
+
+
+def _invert_dict(d):
+    """ return  v-> [k_1,k_2,k_3....] for k,v in d"""
+    res = defaultdict(list)
+    for k,v in d.items():
+        res[v].append(k)
+    return res
+
+
+def mask_to_categorical(y, n_classes, classes, return_cls_dict=False):
+    """generates a multi-channel categorical class map
+
+    Parameters
+    ----------
+    y : n-dimensional ndarray
+        integer label array
+    n_classes : int
+        Number of different classes (without background)
+    classes: dict, integer, or None
+        the label to class assignment
+        can be
+        - dict {label -> class_id}
+           the value of class_id can be
+                             0   -> background class
+                  1...n_classes  -> the respective object class (1 ... n_classes)
+                           None  -> ignore object (prob is set to -1 for the pixels of the object, except for background class)
+        - single integer value or None -> broadcast value to all labels
+
+    Returns
+    -------
+    probability map of shape y.shape+(n_classes+1,) (first channel is background)
+
+    """
+
+    _check_label_array(y, 'y')
+    if not (np.issubdtype(type(n_classes), np.integer) and n_classes>=1):
+        raise ValueError(f"n_classes is '{n_classes}' but should be a positive integer")
+
+    y_labels = np.unique(y[y>0]).tolist()
+
+    # build dict class_id -> labels (inverse of classes)
+    if np.issubdtype(type(classes), np.integer) or classes is None:
+        classes = dict((k,classes) for k in y_labels)
+    elif isinstance(classes, dict):
+        pass
+    else:
+        raise ValueError("classes should be dict, single scalar, or None!")
+
+    if not set(y_labels).issubset(set(classes.keys())):
+        raise ValueError(f"all gt labels should be present in class dict provided \ngt_labels found\n{set(y_labels)}\nclass dict labels provided\n{set(classes.keys())}")
+
+    cls_dict = _invert_dict(classes)
+
+    # prob map
+    y_mask = np.zeros(y.shape+(n_classes+1,), np.float32)
+
+    for cls, labels in cls_dict.items():
+        if cls is None:
+            # prob == -1 will be used in the loss to ignore object
+            y_mask[np.isin(y, labels)] = -1
+        elif np.issubdtype(type(cls), np.integer) and 0 <= cls <= n_classes:
+            y_mask[...,cls] = np.isin(y, labels)
+        else:
+            raise ValueError(f"Wrong class id '{cls}' (for n_classes={n_classes})")
+
+    # set 0/1 background prob (unaffected by None values for class ids)
+    y_mask[...,0] = (y==0)
+
+    if return_cls_dict:
+        return y_mask, cls_dict
+    else:
+        return y_mask
+
+
+def _is_floatarray(x):
+    return isinstance(x.dtype.type(0),np.floating)
+
+
+def abspath(root, relpath):
+    from pathlib import Path
+    root = Path(root)
+    if root.is_dir():
+        path = root/relpath
+    else:
+        path = root.parent/relpath
+    return str(path.absolute())

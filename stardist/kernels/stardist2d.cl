@@ -10,12 +10,13 @@ inline float2 pol2cart(const float rho, const float phi) {
     return (float2)(x,y);
 }
 
-__kernel void star_dist(__global float* dst, read_only image2d_t src) {
+__kernel void star_dist(__global float* dst, read_only image2d_t src, const int grid_y, const int grid_x) {
 
     const int i = get_global_id(0), j = get_global_id(1);
     const int Nx = get_global_size(0), Ny = get_global_size(1);
+    const float2 grid = (float2)(grid_x, grid_y);
 
-    const float2 origin = (float2)(i,j);
+    const float2 origin = (float2)(i,j) * grid;
     const int value = read_imageui(src,sampler,origin).x;
 
     if (value == 0) {
@@ -35,9 +36,13 @@ __kernel void star_dist(__global float* dst, read_only image2d_t src) {
                 offset += dir;
                 const int offset_value = read_imageui(src,sampler,round(origin+offset)).x;
                 if (offset_value != value) {
-                    const float dist = sqrt(offset.x*offset.x + offset.y*offset.y);
-                    dst[k + i*N_RAYS + j*N_RAYS*Nx] = dist;
-                    break;
+                  // small correction as we overshoot the boundary
+                  const float t_corr = .5f/fmax(fabs(dir.x),fabs(dir.y));
+                  offset += (t_corr-1.f)*dir;
+
+                  const float dist = sqrt(offset.x*offset.x + offset.y*offset.y);
+                  dst[k + i*N_RAYS + j*N_RAYS*Nx] = dist;
+                  break;
                 }
             }
         }

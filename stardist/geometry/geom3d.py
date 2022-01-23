@@ -4,10 +4,12 @@ import os
 
 from skimage.measure import regionprops
 from csbdeep.utils import _raise
+from tqdm import tqdm
 
 from ..utils import path_absolute, _normalize_grid
 from ..matching import _check_label_array
-from ..lib.stardist3d import c_star_dist3d, c_polyhedron_to_label, c_dist_to_volume, c_dist_to_centroid
+# from ..lib.stardist3d import c_star_dist3d, c_polyhedron_to_label, c_dist_to_volume, c_dist_to_centroid
+from ..lib.stardist3d import c_star_dist3d, c_polyhedron_to_label
 
 
 
@@ -66,7 +68,8 @@ def _ocl_star_dist3D(lbl, rays, grid=(1,1,1)):
     # if not all(g==1 for g in grid):
     #     raise NotImplementedError("grid not yet implemented for OpenCL version of star_dist3D()...")
 
-    res_shape = tuple(s//g for s, g in zip(lbl.shape, grid))
+    # slicing with grid is done with tuple(slice(0, None, g) for g in grid)
+    res_shape = tuple((s-1)//g+1 for s, g in zip(lbl.shape, grid))
 
     lbl_g = OCLImage.from_array(lbl.astype(np.uint16, copy=False))
     dist_g = OCLArray.empty(res_shape + (len(rays),), dtype=np.float32)
@@ -94,21 +97,33 @@ def star_dist3D(lbl, rays, grid=(1,1,1), mode='cpp'):
         _raise(ValueError("Unknown mode %s" % mode))
 
 
-def polyhedron_to_label(dist, points, rays, shape, prob=None, thr=-np.inf, labels=None, mode="full", verbose=True):
+def polyhedron_to_label(dist, points, rays, shape, prob=None, thr=-np.inf, labels=None, mode="full", verbose=True, overlap_label=None):
     """
     creates labeled image from stardist representations
 
-    mode can be "full", "kernel", or "bbox"
-
-    :param dist: (n_points,n_rays)
-    :param points: (n_points, 3)
-    :param rays: RaysSphere objects with vertices and faces
-    :param prob: (n_points,)
-    :shape :
-
-
-    :param thr:
-    :return:
+    :param dist: array of shape (n_points,n_rays)
+        the list of distances for each point and ray
+    :param points: array of shape (n_points, 3)
+        the list of center points
+    :param rays: Rays object
+        Ray object (e.g. `stardist.Rays_GoldenSpiral`) defining
+        vertices and faces
+    :param shape: (nz,ny,nx)
+        output shape of the image
+    :param prob: array of length/shape (n_points,) or None
+        probability per polyhedron
+    :param thr: scalar
+        probability threshold (only polyhedra with prob>thr are labeled)
+    :param labels: array of length/shape (n_points,) or None
+        labels to use
+    :param mode: str
+        labeling mode, can be "full", "kernel", "hull", "bbox" or  "debug"
+    :param verbose: bool
+        enable to print some debug messages
+    :param overlap_label: scalar or None
+        if given, will label each pixel that belongs ot more than one polyhedron with that label
+    :return: array of given shape
+        labeled image
     """
     if len(points) == 0:
         if verbose:
@@ -175,8 +190,10 @@ def polyhedron_to_label(dist, points, rays, shape, prob=None, thr=-np.inf, label
                                  _prep(rays.vertices, np.float32),
                                  _prep(rays.faces, np.int32),
                                  _prep(labels, np.int32),
-                                 np.int(modes[mode]),
-                                 np.int(verbose),
+                                 np.int32(modes[mode]),
+                                 np.int32(verbose),
+                                 np.int32(overlap_label is not None),
+                                 np.int32(0 if overlap_label is None else overlap_label),
                                  shape
                                  )
 
@@ -184,6 +201,8 @@ def polyhedron_to_label(dist, points, rays, shape, prob=None, thr=-np.inf, label
 def relabel_image_stardist3D(lbl, rays, verbose=False, **kwargs):
     """relabel each label region in `lbl` with its star representation"""
     _check_label_array(lbl, "lbl")
+    if not lbl.ndim==3:
+        raise ValueError("lbl image should be 3 dimensional")
 
     dist_all = star_dist3D(lbl, rays, **kwargs)
 
@@ -216,7 +235,7 @@ def dist_to_volume(dist, rays):
                           _prep(rays.faces, np.int32))
 
 
-def dist_to_centroid(dist, rays, mode = 'absolute'):
+def dist_to_centroid(dist, rays, mode='absolute'):
     """ returns centroids of polyhedra
 
         dist.shape = (nz,ny,nx,nrays)
@@ -236,3 +255,95 @@ def dist_to_centroid(dist, rays, mode = 'absolute'):
                           _prep(rays.vertices, np.float32),
                           _prep(rays.faces, np.int32),
                               np.int32(mode=='absolute'))
+
+
+
+def dist_to_coord3D(dist, points, rays_vertices):
+    """ converts dist/points/rays_vertices to list of coords """
+
+    dist = np.asarray(dist)
+    points = np.asarray(points)
+    rays_vertices = np.asarray(rays_vertices)
+
+    if not all((len(dist)==len(points), dist.ndim==2, points.ndim==2,
+               points.shape[-1]==3, rays_vertices.shape[-1]==3, dist.shape[-1]==len(rays_vertices))):
+        raise ValueError(f"Wrong shapes! dist -> (m,n) points -> (m,3) rays_vertices -> (m,)")
+
+    # return points[:,np.newaxis]+dist[...,np.newaxis]*rays_vertices
+
+    return points[:,np.newaxis]+dist[...,np.newaxis]*rays_vertices
+
+
+def export_to_obj_file3D(polys, fname=None, scale=1, single_mesh=True, uv_map=False, name="poly"):
+    """ exports 3D mesh result to obj file format """
+
+    try:
+        dist = polys["dist"]
+        points = polys["points"]
+        rays_vertices = polys["rays_vertices"]
+        rays_faces = polys["rays_faces"]
+    except KeyError as e:
+        print(e)
+        raise ValueError("polys should be a dict with keys 'dist', 'points', 'rays_vertices', 'rays_faces'  (such as generated by StarDist3D.predict_instances) ")
+
+    coord = dist_to_coord3D(dist, points, rays_vertices)
+
+    if not all((coord.ndim==3, coord.shape[-1]==3, rays_faces.shape[-1]==3)):
+        raise ValueError(f"Wrong shapes! coord -> (m,n,3) rays_faces -> (k,3)")
+
+    if np.isscalar(scale):
+        scale = (scale,)*3
+
+    scale = np.asarray(scale)
+    assert len(scale)==3
+
+    coord *= scale
+
+    obj_str = ""
+    vert_count = 0
+
+    decimals = int(max(1,1-np.log10(np.min(scale))))
+
+
+    scaled_verts = scale*rays_vertices
+    scaled_verts /= np.linalg.norm(scaled_verts,axis = 1, keepdims=True)
+
+
+    vertex_line = f"v {{x:.{decimals}f}} {{y:.{decimals}f}} {{z:.{decimals}f}}\n"
+
+    rays_faces = rays_faces.copy()+1
+
+    for i, xs in enumerate(tqdm(coord)):
+        # reorder to xyz
+        xs = xs[:,[2,1,0]]
+
+        # print(xs)
+
+        # new object
+        if i==0 or not single_mesh:
+            obj_str += f"o {name}_{i:d}\n"
+
+        # vertex coords
+        for x,y,z in xs:
+            obj_str += vertex_line.format(x=x,y=y,z=z)
+
+        if uv_map:
+            # UV coords
+            for vz,vy,vx in scaled_verts:
+                u = 1-(.5 + .5*np.arctan2(vz,vx)/np.pi)
+                v = 1-(.5 - np.arcsin(vy)/np.pi)
+                obj_str +=  f"vt {u:.4f} {v:.4f}\n"
+
+        # face indices
+        for face in rays_faces:
+            obj_str += f"f {face[0]}/{face[0]} {face[1]}/{face[1]} {face[2]}/{face[2]}\n"
+
+        rays_faces += len(xs)
+
+    if fname is not None:
+        with open(fname,"w") as f:
+            f.write(obj_str)
+
+    return obj_str
+
+
